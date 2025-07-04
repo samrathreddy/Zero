@@ -360,22 +360,36 @@ class ZeroDB extends DurableObject<Env> {
   }
 
   async updateUserSettings(userId: string, settings: typeof defaultUserSettings) {
-    return await this.db
-      .insert(userSettings)
-      .values({
-        id: crypto.randomUUID(),
-        userId,
-        settings,
-        createdAt: new Date(),
-        updatedAt: new Date(),
-      })
-      .onConflictDoUpdate({
-        target: userSettings.userId,
-        set: {
-          settings,
-          updatedAt: new Date(),
-        },
+    // Use transaction to prevent race conditions
+    return await this.db.transaction(async (tx) => {
+      const existing = await tx.query.userSettings.findFirst({
+        where: eq(userSettings.userId, userId),
       });
+
+      if (existing) {
+        // Update existing settings
+        return await tx
+          .update(userSettings)
+          .set({
+            settings,
+            updatedAt: new Date(),
+          })
+          .where(eq(userSettings.userId, userId))
+          .returning();
+      } else {
+        // Create new settings
+        return await tx
+          .insert(userSettings)
+          .values({
+            id: crypto.randomUUID(),
+            userId,
+            settings,
+            createdAt: new Date(),
+            updatedAt: new Date(),
+          })
+          .returning();
+      }
+    });
   }
 
   async createConnection(
@@ -409,14 +423,32 @@ class ZeroDB extends DurableObject<Env> {
   }
 
   /**
-   * @param connectionId Dangerous, use findUserConnection instead
+   * @deprecated This method is dangerous as it doesn't validate user ownership.
+   * Use findUserConnection instead for security.
+   * @param connectionId
    * @returns
    */
   async findConnectionById(
     connectionId: string,
   ): Promise<typeof connection.$inferSelect | undefined> {
+    console.warn('[SECURITY WARNING] Using deprecated findConnectionById method. Use findUserConnection instead.');
     return await this.db.query.connection.findFirst({
       where: eq(connection.id, connectionId),
+    });
+  }
+
+  /**
+   * Safe method to find connection with user validation
+   * @param userId User ID to validate ownership
+   * @param connectionId Connection ID to find
+   * @returns Connection if it belongs to the user, undefined otherwise
+   */
+  async findConnectionByIdSafe(
+    userId: string,
+    connectionId: string,
+  ): Promise<typeof connection.$inferSelect | undefined> {
+    return await this.db.query.connection.findFirst({
+      where: and(eq(connection.id, connectionId), eq(connection.userId, userId)),
     });
   }
 

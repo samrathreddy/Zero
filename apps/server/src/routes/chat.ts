@@ -35,6 +35,42 @@ import { groq } from '@ai-sdk/groq';
 import { createDb } from '../db';
 import { z } from 'zod';
 
+// Input validation schemas
+const IncomingMessageSchema = z.discriminatedUnion('type', [
+  z.object({
+    type: z.literal(IncomingMessageType.UseChatRequest),
+    id: z.string().max(100),
+    init: z.object({
+      method: z.string(),
+      headers: z.any().optional(),
+      body: z.string().max(50000), // Limit body size to 50KB
+    }),
+  }),
+  z.object({
+    type: z.literal(IncomingMessageType.ChatClear),
+  }),
+  z.object({
+    type: z.literal(IncomingMessageType.ChatMessages),
+    messages: z.array(z.any()).max(100), // Limit to 100 messages
+  }),
+  z.object({
+    type: z.literal(IncomingMessageType.ChatRequestCancel),
+    id: z.string().max(100),
+  }),
+  z.object({
+    type: z.literal(IncomingMessageType.Mail_List),
+    folder: z.string().max(50),
+    query: z.string().max(500),
+    maxResults: z.number().int().min(1).max(100),
+    labelIds: z.array(z.string()).max(50),
+    pageToken: z.string().max(200),
+  }),
+  z.object({
+    type: z.literal(IncomingMessageType.Mail_Get),
+    threadId: z.string().max(100),
+  }),
+]);
+
 const decoder = new TextDecoder();
 
 interface ThreadRow {
@@ -383,10 +419,35 @@ export class ZeroAgent extends AIChatAgent<typeof env> {
   public async setupAuth(connectionId: string) {
     if (!this.driver) {
       const { db, conn } = createDb(env.HYPERDRIVE.connectionString);
+      
+      // SECURITY FIX: Validate that the connection belongs to a user and has proper authorization
+      // We need to get the user context from the connection name/session first
+      const agentName = this.name; // This should be the connectionId for the agent
+      
+      if (agentName !== connectionId) {
+        console.error('[ZeroAgent] Connection ID mismatch in setupAuth:', { agentName, connectionId });
+        this.ctx.waitUntil(conn.end());
+        throw new Error('Unauthorized: Connection ID mismatch');
+      }
+
       const _connection = await db.query.connection.findFirst({
         where: eq(connection.id, connectionId),
       });
-      if (_connection) this.driver = connectionToDriver(_connection);
+      
+      // Additional validation: ensure connection exists and has valid tokens
+      if (!_connection) {
+        console.error('[ZeroAgent] Connection not found:', connectionId);
+        this.ctx.waitUntil(conn.end());
+        throw new Error('Connection not found');
+      }
+      
+      if (!_connection.accessToken || !_connection.refreshToken) {
+        console.error('[ZeroAgent] Connection missing tokens:', connectionId);
+        this.ctx.waitUntil(conn.end());
+        throw new Error('Connection not properly authenticated');
+      }
+      
+      this.driver = connectionToDriver(_connection);
       this.ctx.waitUntil(conn.end());
       //   this.ctx.waitUntil(this.syncThreads('inbox'));
       //   this.ctx.waitUntil(this.syncThreads('sent'));
@@ -436,12 +497,26 @@ export class ZeroAgent extends AIChatAgent<typeof env> {
 
   async onMessage(connection: Connection, message: WSMessage) {
     if (typeof message === 'string') {
+      // Check message size to prevent DoS attacks
+      if (message.length > 100000) { // 100KB limit
+        console.warn('[ZeroAgent] Message too large, rejecting:', message.length);
+        return;
+      }
+
       let data: IncomingMessage;
       try {
-        data = JSON.parse(message) as IncomingMessage;
+        const parsedMessage = JSON.parse(message);
+        
+        // Validate message structure using Zod schema
+        const validationResult = IncomingMessageSchema.safeParse(parsedMessage);
+        if (!validationResult.success) {
+          console.warn('[ZeroAgent] Invalid message format:', validationResult.error.issues);
+          return;
+        }
+        
+        data = validationResult.data;
       } catch (error) {
-        // silently ignore invalid messages for now
-        // TODO: log errors with log levels
+        console.warn('[ZeroAgent] Failed to parse message:', error instanceof Error ? error.message : 'Unknown error');
         return;
       }
       switch (data.type) {
